@@ -1,5 +1,6 @@
 import express, { Application, Request, Response } from 'express';
 import dotenv from 'dotenv';
+import cors from 'cors';
 import prisma from './config/prisma';
 import http from 'http';
 import { initializeWebSocket } from './socket/socket';
@@ -10,6 +11,8 @@ dotenv.config();
 
 export const app: Application = express();
 const PORT = process.env.PORT || 5050;
+
+app.use(cors());
 
 app.use(express.json());
 
