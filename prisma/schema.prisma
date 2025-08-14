@@ -1,0 +1,51 @@
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+  // output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+// User Model: Represents a user in the terminal chat application
+enum Role {
+  USER
+  ADMIN
+}
+
+// User Model: Represents a user in the terminal chat application
+model User {
+  id          String      @id @default(auto()) @map("_id") @db.ObjectId
+  username    String      @unique
+  email       String      @unique
+  password    String
+  role        Role        @default(USER) 
+  publicKey   String?  
+
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  // Relations:
+  sentMessages      Message[]   @relation("SenderMessages")
+  receivedMessages  Message[]   @relation("ReceiverMessages")
+}
+
+
+// Message Model: Represents a single chat message exchanged between two users
+model Message {
+  id          String      @id @default(auto()) @map("_id") @db.ObjectId
+  content     Json
+  timestamp   DateTime    @default(now())
+  read        Boolean     @default(false) 
+
+  // Sender of the message (relates to User)
+  senderId String @db.ObjectId // Foreign key for the sender user
+  sender   User   @relation("SenderMessages", fields: [senderId], references: [id])
+
+  // Receiver of the message (relates to User)
+  receiverId String @db.ObjectId // Foreign key for the receiver user
+  receiver   User   @relation("ReceiverMessages", fields: [receiverId], references: [id])
+}
