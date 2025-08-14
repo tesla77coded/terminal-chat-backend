@@ -2,13 +2,12 @@
   "name": "backend",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "server.ts",
   "scripts": {
     "start": "node dist/server.js",
     "dev": "npx ts-node server.ts",
     "test": "jest",
     "build": "tsc"
-    
   },
   "keywords": [],
   "author": "",
