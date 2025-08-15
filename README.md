@@ -2,7 +2,7 @@
 
 This is the backend server for the Terminal Chat application. It is a modern, robust server built with Node.js, TypeScript, and Express, designed to handle real-time, end-to-end encrypted messaging.
 
-**Note:** The main client application for this project can be found here: [github.com/your-username/terminal-chat-client](https://github.com/your-username/terminal-chat-client)
+**Note:** The main client application for this project can be found here: [https://github.com/tesla77coded/terminal-chat-client.git](https://github.com/tesla77coded/terminal-chat-client.git)
 
 ---
 
