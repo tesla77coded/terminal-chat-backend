@@ -33,7 +33,8 @@ export const getMessages = async (req: Request, res: Response) => {
     // --------------------------------
 
     console.log(`CACHE MISS for key: ${cacheKey}. Fetching from DB.`);
-    const messages = await prisma.message.findMany({
+
+    const messagesFromDb = await prisma.message.findMany({
       where: {
         OR: [
           { senderId: currentUserId, receiverId: otherUserId },
@@ -45,11 +46,24 @@ export const getMessages = async (req: Request, res: Response) => {
       },
     });
 
-    if (messages.length > 0) {
-      await redis.set(cacheKey, JSON.stringify(messages), 'EX', 3600);
+    const messagesForClient = messagesFromDb.map(msg => {
+      const content = (msg.senderId === currentUserId)
+        ? msg.contentForSender // If I sent it, give me my copy
+        : msg.contentForReceiver; // If I received it, give me my copy
+
+      return {
+        id: msg.id,
+        senderId: msg.senderId,
+        timestamp: msg.timestamp,
+        content: content, // Send the single, correct encrypted blob
+      };
+    });
+
+    if (messagesForClient.length > 0) {
+      await redis.set(cacheKey, JSON.stringify(messagesForClient), 'EX', 3600);
     }
 
-    res.json(messages);
+    res.json(messagesForClient);
 
   } catch (error) {
     console.error(error);

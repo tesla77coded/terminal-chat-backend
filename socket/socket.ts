@@ -20,7 +20,7 @@ export const initializeWebSocket = (server: http.Server) => {
       try {
         const parsedMessage = JSON.parse(message);
 
-        //  1: Handle Authentication on the first message ---
+        // 1: Handle Authentication on the first message ---
         if (parsedMessage.type === 'auth' && parsedMessage.token) {
           if (userId) { // Already authenticated
             return;
@@ -49,30 +49,46 @@ export const initializeWebSocket = (server: http.Server) => {
           return;
         }
 
-        if (parsedMessage.type === 'message' && parsedMessage.receiverId && parsedMessage.content) {
-          console.log('✅ Message type recognized. Attempting to save to DB...');
-          const { receiverId, content } = parsedMessage;
-          // Save message to database
+        if (parsedMessage.type === 'message' && parsedMessage.receiverId && parsedMessage.contentForSender && parsedMessage.contentForReceiver) {
+          const { receiverId, contentForSender, contentForReceiver } = parsedMessage;
+
+          // Parse content fields to ensure they are objects, not strings
+          const contentForSenderParsed = typeof contentForSender === 'string' ? JSON.parse(contentForSender) : contentForSender;
+          const contentForReceiverParsed = typeof contentForReceiver === 'string' ? JSON.parse(contentForReceiver) : contentForReceiver;
+
+          // Validate content structure
+          if (!contentForSenderParsed.iv || !contentForSenderParsed.encryptedKey || !contentForSenderParsed.encryptedMessage || !contentForSenderParsed.authTag ||
+            !contentForReceiverParsed.iv || !contentForReceiverParsed.encryptedKey || !contentForReceiverParsed.encryptedMessage || !contentForReceiverParsed.authTag) {
+            throw new Error('Invalid content format');
+          }
+
+          // 1. Save both encrypted versions to the database
           const dbMessage = await prisma.message.create({
-            data: { content, senderId: userId, receiverId: receiverId },
+            data: {
+              senderId: userId,
+              receiverId: receiverId,
+              contentForSender: contentForSenderParsed,
+              contentForReceiver: contentForReceiverParsed,
+              timestamp: new Date(),
+            },
           });
-          console.log('✅ Message saved to DB with ID:', dbMessage.id);
 
-          // Invalidate the Redis cache for this conversation
           const sortedUserIds = [userId, receiverId].sort();
-          const cacheKey = `chat:${sortedUserIds[0]}:${sortedUserIds[1]}`;
-          await redis.del(cacheKey);
-          console.log(`CACHE INVALIDATED for key: ${cacheKey}`);
+          const cacheKeyUser1 = `chat:${sortedUserIds[0]}:${sortedUserIds[1]}:user:${userId}`;
+          const cacheKeyUser2 = `chat:${sortedUserIds[0]}:${sortedUserIds[1]}:user:${receiverId}`;
+          await redis.del(cacheKeyUser1);
+          await redis.del(cacheKeyUser2);
+          console.log(`CACHE INVALIDATED for keys: ${cacheKeyUser1}, ${cacheKeyUser2}`);
 
-          // forward message to receiver if they are online.
+          // 2. Forward the correct payload to the receiver
           const receiverSocket = clients.get(receiverId);
           if (receiverSocket) {
             receiverSocket.send(
               JSON.stringify({
                 type: 'message',
                 id: dbMessage.id,
-                content: dbMessage.content,
                 senderId: dbMessage.senderId,
+                content: dbMessage.contentForReceiver,
                 timestamp: dbMessage.timestamp,
               })
             );

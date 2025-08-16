@@ -142,19 +142,18 @@ export const uploadPublicKey = async (req: Request, res: Response) => {
       return res.status(400).json({ message: 'Public key is required.' });
     }
 
+    // Receive the full PEM key and trim any transport whitespace
     await prisma.user.update({
       where: { id: userId },
-      data: { publicKey },
+      data: { publicKey: publicKey.trim() },
     });
 
     res.status(200).json({ message: 'Public key updated successfully.' });
-
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: 'Server error.' });
-  };
+  }
 };
-
 
 
 // @desc      Get public key of a specified user
