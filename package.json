@@ -4,11 +4,10 @@
   "description": "",
   "main": "dist/server.js",
   "scripts": {
-    "start": "npx prisma db push && node dist/server.js",
+    "start": "pwd && ls -la . && ls -la dist/ && npx prisma db push && node $(pwd)/dist/server.js",
     "dev": "npx ts-node server.ts",
     "test": "jest",
-    "build": "npx prisma generate && tsc",
-    "postbuild": "npx prisma db push"
+    "build": "npx prisma generate && tsc && pwd && ls -la dist/"
   },
   "keywords": [],
   "author": "",
