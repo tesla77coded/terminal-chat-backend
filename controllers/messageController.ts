@@ -19,9 +19,10 @@ export const getMessages = async (req: Request, res: Response) => {
       `[Messages] user=${currentUserId} peer=${otherUserId} :: START (GET /api/messages/:otherUserId)`
     );
 
-    // mark unread->read for inbound msgs
+    // --- MARK READ (fire-and-forget) ---------------------------------------
+    // Start update but do NOT await it — log result when it completes.
     const markStart = Date.now();
-    const markResult = await prisma.message.updateMany({
+    prisma.message.updateMany({
       where: {
         senderId: otherUserId,
         receiverId: currentUserId,
@@ -30,10 +31,15 @@ export const getMessages = async (req: Request, res: Response) => {
       data: {
         read: true,
       },
-    });
-    console.log(
-      `[Messages] Mark read -> count=${markResult.count} (${Date.now() - markStart}ms)`
-    );
+    })
+      .then(result => {
+        console.log(
+          `[Messages] Mark read -> count=${(result as any).count} (${Date.now() - markStart}ms) (async)`
+        );
+      })
+      .catch(err => {
+        console.error('[Messages] Mark read (async) failed:', err);
+      });
 
     // viewer-scoped cache key (so each side gets its decryptable copy)
     const sortedUserIds = [currentUserId, otherUserId].sort();
@@ -146,62 +152,110 @@ export const getChats = async (req: Request, res: Response) => {
     const currentUserId = req.user!.id;
     console.log(`[Chats] Fetch for user=${currentUserId}`);
 
+    const cacheKey = `chats:viewer:${currentUserId}`;
+
+    // Try Redis first
+    const rGetStart = Date.now();
+    const cached = await redis.get(cacheKey);
+    const rGetMs = Date.now() - rGetStart;
+
+    if (cached) {
+      console.log(`[Redis] HIT key=${cacheKey} getTime=${rGetMs}ms size=${Buffer.byteLength(cached, 'utf8')}B`);
+      try {
+        const parsed = JSON.parse(cached as string);
+        console.log(`[Chats] RETURN (HIT) items=${Array.isArray(parsed) ? parsed.length : 'n/a'} totalTime=${Date.now() - start}ms`);
+        res.setHeader('X-Cache', 'HIT');
+        return res.json(parsed);
+      } catch (e) {
+        console.error(`[Redis] Parse error for chats cache key=${cacheKey}. Deleting corrupt cache.`, e);
+        await redis.del(cacheKey);
+        // continue to DB fetch
+      }
+    } else {
+      console.log(`[Redis] MISS key=${cacheKey} getTime=${rGetMs}ms`);
+    }
+
+    // Fetch from DB (existing logic)
     const msgsStart = Date.now();
     const messages = await prisma.message.findMany({
       where: {
-        OR: [{ senderId: currentUserId }, { receiverId: currentUserId }],
+        OR: [
+          { senderId: currentUserId },
+          { receiverId: currentUserId },
+        ],
       },
-      select: { senderId: true, receiverId: true },
+      select: {
+        senderId: true,
+        receiverId: true,
+      },
     });
     console.log(
-      `[Chats] Baseline message scan count=${messages.length} time=${Date.now() - msgsStart
-      }ms`
+      `[Chats] Baseline message scan count=${messages.length} time=${Date.now() - msgsStart}ms`
     );
 
     const chatPartnerIds = new Set<string>();
     messages.forEach(msg => {
-      if (msg.senderId === currentUserId) chatPartnerIds.add(msg.receiverId);
-      else chatPartnerIds.add(msg.senderId);
+      if (msg.senderId === currentUserId) {
+        chatPartnerIds.add(msg.receiverId);
+      } else {
+        chatPartnerIds.add(msg.senderId);
+      }
     });
 
     const usersStart = Date.now();
     const chatPartners = await prisma.user.findMany({
-      where: { id: { in: [...chatPartnerIds] } },
-      select: { id: true, username: true },
+      where: {
+        id: {
+          in: [...chatPartnerIds],
+        },
+      },
+      select: {
+        id: true,
+        username: true,
+      },
     });
     console.log(
-      `[Chats] Loaded partner profiles count=${chatPartners.length} time=${Date.now() - usersStart
-      }ms`
+      `[Chats] Loaded partner profiles count=${chatPartners.length} time=${Date.now() - usersStart}ms`
     );
 
     const detailsStart = Date.now();
     const chatsWithDetails = await Promise.all(
-      chatPartners.map(async partner => {
+      chatPartners.map(async (partner) => {
         const unreadCount = await prisma.message.count({
           where: { senderId: partner.id, receiverId: currentUserId, read: false },
         });
 
+        // Get the timestamp of the very last message
         const lastMessage = await prisma.message.findFirst({
           where: {
             OR: [
               { senderId: currentUserId, receiverId: partner.id },
               { senderId: partner.id, receiverId: currentUserId },
-            ],
+            ]
           },
-          orderBy: { timestamp: 'desc' },
+          orderBy: { timestamp: 'desc' }
         });
 
         return {
           ...partner,
           unreadCount,
-          lastMessageTimestamp: lastMessage?.timestamp || new Date(0),
+          lastMessageTimestamp: lastMessage?.timestamp || new Date(0)
         };
       })
     );
     console.log(
-      `[Chats] Details aggregated count=${chatsWithDetails.length} time=${Date.now() - detailsStart
-      }ms totalTime=${Date.now() - start}ms`
+      `[Chats] Details aggregated count=${chatsWithDetails.length} time=${Date.now() - detailsStart}ms totalTime=${Date.now() - start}ms`
     );
+
+    // Cache chats for viewer
+    try {
+      const rSetStart = Date.now();
+      const payload = JSON.stringify(chatsWithDetails);
+      await redis.set(cacheKey, payload, 'EX', CACHE_TTL_SECONDS);
+      console.log(`[Redis] SET key=${cacheKey} ttl=${CACHE_TTL_SECONDS}s setTime=${Date.now() - rSetStart}ms size=${Buffer.byteLength(payload, 'utf8')}B`);
+    } catch (e) {
+      console.error('[Redis] Failed to set chats cache', e);
+    }
 
     res.json(chatsWithDetails);
   } catch (error) {

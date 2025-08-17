@@ -15,31 +15,32 @@ type HybridEncrypted = {
 type IncomingWS =
   | { type: 'auth'; token: string }
   | {
-      type: 'message';
-      receiverId: string;
-      contentForSender: HybridEncrypted | string;
-      contentForReceiver: HybridEncrypted | string;
-    };
+    type: 'message';
+    receiverId: string;
+    contentForSender: HybridEncrypted | string;
+    contentForReceiver: HybridEncrypted | string;
+  };
 
 type OutgoingWS =
   | { type: 'auth_success'; message: string }
   | { type: 'auth_error'; message: string }
   | {
-      type: 'message';
-      id: string;
-      senderId: string;
-      content: HybridEncrypted;
-      timestamp: string;
-    }
+    type: 'message';
+    id: string;
+    senderId: string;
+    content: HybridEncrypted;
+    timestamp: string;
+  }
   | { type: 'message_sent_ack'; messageId: string }
   | { type: 'error'; message: string };
 
 const clients = new Map<string, WebSocket>();
 
-// NEW: cache settings
-const HISTORY_CACHE_LIMIT = 100;       // keep latest 100 per viewer
-const CACHE_TTL_SECONDS = 3600;        // 1 hour TTL
+// NEW: cache settings (same as before, adjust if needed)
+const HISTORY_CACHE_LIMIT = 100; // keep latest 100 per viewer
+const CACHE_TTL_SECONDS = 3600;
 
+// helper to check the encryption shape
 function isHybridEncrypted(obj: any): obj is HybridEncrypted {
   return (
     obj &&
@@ -51,13 +52,13 @@ function isHybridEncrypted(obj: any): obj is HybridEncrypted {
   );
 }
 
-// NEW: helper to build consistent viewer-scoped cache keys
+// helper to normalize viewer-scoped message cache key
 function viewerCacheKey(a: string, b: string, viewerId: string) {
   const [x, y] = [a, b].sort();
   return `chat:${x}:${y}:viewer:${viewerId}`;
 }
 
-// NEW: safe JSON.parse
+// safe parse
 function safeParse<T>(s: string | null): T | null {
   if (!s) return null;
   try {
@@ -67,7 +68,7 @@ function safeParse<T>(s: string | null): T | null {
   }
 }
 
-// NEW: prepend a single item to a viewer’s cached array (bounded + TTL)
+// prepend to viewer cache (bounded + TTL)
 async function prependToViewerCache(
   key: string,
   item: { id: string; senderId: string; timestamp: string; content: HybridEncrypted }
@@ -79,7 +80,6 @@ async function prependToViewerCache(
     if (arr.length > HISTORY_CACHE_LIMIT) arr.length = HISTORY_CACHE_LIMIT;
     await redis.set(key, JSON.stringify(arr), 'EX', CACHE_TTL_SECONDS);
   } catch (e) {
-    // Cache failures should never break messaging; log and continue
     console.error('Redis cache update failed:', (e as Error).message);
   }
 }
@@ -158,7 +158,7 @@ export const initializeWebSocket = (server: http.Server) => {
             },
           });
 
-          // --- NEW: Update viewer-scoped Redis caches (no longer just invalidate) ---
+          // Build viewer-specific cache entries (sender's copy + receiver's copy)
           const tsISO = dbMessage.timestamp.toISOString();
 
           const senderView = {
@@ -177,11 +177,28 @@ export const initializeWebSocket = (server: http.Server) => {
           const senderKey = viewerCacheKey(userId, receiverId, userId);
           const receiverKey = viewerCacheKey(userId, receiverId, receiverId);
 
-          // Try to prepend to existing caches; if key doesn't exist, this will create it.
+          // Update per-viewer message caches (non-blocking but awaited here to keep cache warm)
           await Promise.all([
             prependToViewerCache(senderKey, senderView),
             prependToViewerCache(receiverKey, receiverView),
           ]);
+
+          // ===== NEW: invalidate chat-list caches for both participants =====
+          // This ensures the chat-list (unreadCount / lastMessageTimestamp) is refreshed on next fetch.
+          try {
+            const chatKeySender = `chats:viewer:${userId}`;
+            const chatKeyReceiver = `chats:viewer:${receiverId}`;
+            // use allSettled so Redis failures won't crash the flow
+            const delResults = await Promise.allSettled([
+              redis.del(chatKeySender),
+              redis.del(chatKeyReceiver),
+            ]);
+            // log outcome (debug)
+            console.log(`[Redis] Invalidated chat-list caches: ${chatKeySender}, ${chatKeyReceiver}`, delResults.map(r => (r as any).status));
+          } catch (e) {
+            console.error('[Redis] Failed to invalidate chat-list caches', (e as Error).message);
+          }
+          // =================================================================
 
           // Realtime to receiver -> their decryptable copy
           const receiverSocket = clients.get(receiverId);
