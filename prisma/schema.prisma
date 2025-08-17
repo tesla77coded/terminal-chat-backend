@@ -1,5 +1,3 @@
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
 generator client {
   provider = "prisma-client-js"
   // output   = "../generated/prisma"
@@ -33,22 +31,24 @@ model User {
   receivedMessages  Message[]   @relation("ReceiverMessages")
 }
 
-
 // Message Model: Represents a single chat message exchanged between two users
+
 model Message {
-  id          String      @id @default(auto()) @map("_id") @db.ObjectId
-  timestamp   DateTime    @default(now())
-  read        Boolean     @default(false) 
+
+  id                 String   @id @default(auto()) @map("_id") @db.ObjectId
+  timestamp          DateTime @default(now())
+  read               Boolean  @default(false)
 
   // store two encrypted versions
-  contentForSender    Json
-  contentForReceiver  Json
+  contentForSender   Json
+  contentForReceiver Json
 
-  // Sender of the message (relates to User)
-  senderId String @db.ObjectId // Foreign key for the sender user
-  sender   User   @relation("SenderMessages", fields: [senderId], references: [id])
+  // relations
+  senderId   String @db.ObjectId
+  sender     User   @relation("SenderMessages",   fields: [senderId],   references: [id])
 
-  // Receiver of the message (relates to User)
-  receiverId String @db.ObjectId // Foreign key for the receiver user
+  receiverId String @db.ObjectId
   receiver   User   @relation("ReceiverMessages", fields: [receiverId], references: [id])
-}
+
+  @@index([senderId, receiverId, timestamp])
+  }

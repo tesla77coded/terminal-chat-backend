@@ -23,7 +23,7 @@ export const getMessages = async (req: Request, res: Response) => {
     });
 
     const sortedUserIds = [currentUserId, otherUserId].sort();
-    const cacheKey = `chat:${sortedUserIds[0]}:${sortedUserIds[1]}`;
+    const cacheKey = `chat:${sortedUserIds[0]}:${sortedUserIds[1]}:viewer:${currentUserId}`;
     const cachedMessages = await redis.get(cacheKey);
 
     if (cachedMessages) {

@@ -3,111 +3,170 @@
 import http from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import jwt from 'jsonwebtoken';
-import redis from '../config/redis';
 import prisma from '../config/prisma';
+import redis from '../config/redis';
 
-// A map to store active connections (userId -> WebSocket)
+type HybridEncrypted = {
+  iv: string;
+  encryptedKey: string;
+  encryptedMessage: string;
+  authTag: string;
+};
+
+type IncomingWS =
+  | { type: 'auth'; token: string }
+  | {
+    type: 'message';
+    receiverId: string;
+    contentForSender: HybridEncrypted | string;
+    contentForReceiver: HybridEncrypted | string;
+  };
+
+type OutgoingWS =
+  | { type: 'auth_success'; message: string }
+  | { type: 'auth_error'; message: string }
+  | {
+    type: 'message';
+    id: string;
+    senderId: string;
+    content: HybridEncrypted;
+    timestamp: string;
+  }
+  | { type: 'message_sent_ack'; messageId: string }
+  | { type: 'error'; message: string };
+
 const clients = new Map<string, WebSocket>();
+
+function isHybridEncrypted(obj: any): obj is HybridEncrypted {
+  return (
+    obj &&
+    typeof obj === 'object' &&
+    typeof obj.iv === 'string' &&
+    typeof obj.encryptedKey === 'string' &&
+    typeof obj.encryptedMessage === 'string' &&
+    typeof obj.authTag === 'string'
+  );
+}
 
 export const initializeWebSocket = (server: http.Server) => {
   const wss = new WebSocketServer({ server });
 
   wss.on('connection', (ws: WebSocket) => {
-    console.log('🚀 A new client connected!');
     let userId: string | null = null;
 
-    ws.on('message', async (message: string) => {
+    ws.on('message', async (raw: string) => {
       try {
-        const parsedMessage = JSON.parse(message);
+        const parsed: IncomingWS = JSON.parse(raw);
 
-        // 1: Handle Authentication on the first message ---
-        if (parsedMessage.type === 'auth' && parsedMessage.token) {
-          if (userId) { // Already authenticated
-            return;
-          }
+        // 1) AUTH --------------------------------------------------------------
+        if (parsed.type === 'auth') {
+          if (userId) return; // already authed
           try {
             const decoded = jwt.verify(
-              parsedMessage.token,
+              parsed.token,
               process.env.JWT_SECRET as string
             ) as { id: string };
 
             userId = decoded.id;
             clients.set(userId, ws);
-            console.log(`User ${userId} authenticated and connected.`);
-            ws.send(JSON.stringify({ type: 'auth_success', message: 'Authentication successful' }));
-          } catch (error) {
-            console.log('Authentication failed');
-            ws.send(JSON.stringify({ type: 'auth_error', message: 'Invalid token' }));
+            const msg: OutgoingWS = {
+              type: 'auth_success',
+              message: 'Authentication successful',
+            };
+            ws.send(JSON.stringify(msg));
+          } catch {
+            const msg: OutgoingWS = {
+              type: 'auth_error',
+              message: 'Invalid token',
+            };
+            ws.send(JSON.stringify(msg));
             ws.close();
           }
-          return; // Stop processing after auth message
-        }
-
-        // 2: Handle incoming chat messages (only if authenticated) ---
-        if (!userId) {
-          ws.send(JSON.stringify({ type: 'error', message: 'Not authenticated' }));
           return;
         }
 
-        if (parsedMessage.type === 'message' && parsedMessage.receiverId && parsedMessage.contentForSender && parsedMessage.contentForReceiver) {
-          const { receiverId, contentForSender, contentForReceiver } = parsedMessage;
+        // 2) GUARD: must be authed for anything else ---------------------------
+        if (!userId) {
+          const msg: OutgoingWS = {
+            type: 'error',
+            message: 'Not authenticated',
+          };
+          ws.send(JSON.stringify(msg));
+          return;
+        }
 
-          // Parse content fields to ensure they are objects, not strings
-          const contentForSenderParsed = typeof contentForSender === 'string' ? JSON.parse(contentForSender) : contentForSender;
-          const contentForReceiverParsed = typeof contentForReceiver === 'string' ? JSON.parse(contentForReceiver) : contentForReceiver;
+        // 3) INCOMING CHAT MESSAGE --------------------------------------------
+        if (parsed.type === 'message') {
+          const { receiverId } = parsed;
 
-          // Validate content structure
-          if (!contentForSenderParsed.iv || !contentForSenderParsed.encryptedKey || !contentForSenderParsed.encryptedMessage || !contentForSenderParsed.authTag ||
-            !contentForReceiverParsed.iv || !contentForReceiverParsed.encryptedKey || !contentForReceiverParsed.encryptedMessage || !contentForReceiverParsed.authTag) {
+          // Normalize & validate blobs (strings -> objects)
+          const s = typeof parsed.contentForSender === 'string'
+            ? JSON.parse(parsed.contentForSender)
+            : parsed.contentForSender;
+          const r = typeof parsed.contentForReceiver === 'string'
+            ? JSON.parse(parsed.contentForReceiver)
+            : parsed.contentForReceiver;
+
+          if (!isHybridEncrypted(s) || !isHybridEncrypted(r)) {
             throw new Error('Invalid content format');
           }
 
-          // 1. Save both encrypted versions to the database
+          // Persist both versions
           const dbMessage = await prisma.message.create({
             data: {
               senderId: userId,
-              receiverId: receiverId,
-              contentForSender: contentForSenderParsed,
-              contentForReceiver: contentForReceiverParsed,
+              receiverId,
+              contentForSender: s,
+              contentForReceiver: r,
               timestamp: new Date(),
             },
           });
 
-          const sortedUserIds = [userId, receiverId].sort();
-          const cacheKeyUser1 = `chat:${sortedUserIds[0]}:${sortedUserIds[1]}:user:${userId}`;
-          const cacheKeyUser2 = `chat:${sortedUserIds[0]}:${sortedUserIds[1]}:user:${receiverId}`;
-          await redis.del(cacheKeyUser1);
-          await redis.del(cacheKeyUser2);
-          console.log(`CACHE INVALIDATED for keys: ${cacheKeyUser1}, ${cacheKeyUser2}`);
+          // Invalidate BOTH viewers' caches (viewer-scoped key, see controller fix below)
+          const ids = [userId, receiverId].sort();
+          const base = `chat:${ids[0]}:${ids[1]}`;
+          await redis.del(`${base}:viewer:${userId}`);
+          await redis.del(`${base}:viewer:${receiverId}`);
 
-          // 2. Forward the correct payload to the receiver
+          // Realtime to receiver -> their decryptable copy
           const receiverSocket = clients.get(receiverId);
           if (receiverSocket) {
-            receiverSocket.send(
-              JSON.stringify({
-                type: 'message',
-                id: dbMessage.id,
-                senderId: dbMessage.senderId,
-                content: dbMessage.contentForReceiver,
-                timestamp: dbMessage.timestamp,
-              })
-            );
+            const out: OutgoingWS = {
+              type: 'message',
+              id: dbMessage.id,
+              senderId: dbMessage.senderId,
+              content: dbMessage.contentForReceiver as HybridEncrypted,
+              timestamp: dbMessage.timestamp.toISOString(),
+            };
+            receiverSocket.send(JSON.stringify(out));
           }
-          ws.send(JSON.stringify({ type: 'message_sent_ack', messageId: dbMessage.id }));
+
+          // Optional: notify sender too (UI currently ignores since senderId!==contact.id)
+          const senderSocket = clients.get(userId);
+          if (senderSocket) {
+            const out: OutgoingWS = {
+              type: 'message',
+              id: dbMessage.id,
+              senderId: dbMessage.senderId,
+              content: dbMessage.contentForSender as HybridEncrypted,
+              timestamp: dbMessage.timestamp.toISOString(),
+            };
+            senderSocket.send(JSON.stringify(out));
+          }
+
+          // Ack back to sender (kept for UX/debug)
+          const ack: OutgoingWS = { type: 'message_sent_ack', messageId: dbMessage.id };
+          ws.send(JSON.stringify(ack));
         }
-      } catch (error) {
-        console.error('Failed to parse or handle message:', error);
-        ws.send(JSON.stringify({ type: 'error', message: 'Invalid message format' }));
+      } catch (err) {
+        console.error('WS error:', err);
+        const msg: OutgoingWS = { type: 'error', message: 'Invalid message format' };
+        ws.send(JSON.stringify(msg));
       }
     });
 
     ws.on('close', () => {
-      if (userId) {
-        clients.delete(userId);
-        console.log(`User ${userId} disconnected.`);
-      } else {
-        console.log('An unauthenticated user disconnected.');
-      }
+      if (userId) clients.delete(userId);
     });
   });
 
