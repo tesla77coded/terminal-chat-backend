@@ -1,5 +1,4 @@
 /// <reference path="../types/express/index.d.ts" />
-
 import http from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import jwt from 'jsonwebtoken';
@@ -16,26 +15,30 @@ type HybridEncrypted = {
 type IncomingWS =
   | { type: 'auth'; token: string }
   | {
-    type: 'message';
-    receiverId: string;
-    contentForSender: HybridEncrypted | string;
-    contentForReceiver: HybridEncrypted | string;
-  };
+      type: 'message';
+      receiverId: string;
+      contentForSender: HybridEncrypted | string;
+      contentForReceiver: HybridEncrypted | string;
+    };
 
 type OutgoingWS =
   | { type: 'auth_success'; message: string }
   | { type: 'auth_error'; message: string }
   | {
-    type: 'message';
-    id: string;
-    senderId: string;
-    content: HybridEncrypted;
-    timestamp: string;
-  }
+      type: 'message';
+      id: string;
+      senderId: string;
+      content: HybridEncrypted;
+      timestamp: string;
+    }
   | { type: 'message_sent_ack'; messageId: string }
   | { type: 'error'; message: string };
 
 const clients = new Map<string, WebSocket>();
+
+// NEW: cache settings
+const HISTORY_CACHE_LIMIT = 100;       // keep latest 100 per viewer
+const CACHE_TTL_SECONDS = 3600;        // 1 hour TTL
 
 function isHybridEncrypted(obj: any): obj is HybridEncrypted {
   return (
@@ -46,6 +49,39 @@ function isHybridEncrypted(obj: any): obj is HybridEncrypted {
     typeof obj.encryptedMessage === 'string' &&
     typeof obj.authTag === 'string'
   );
+}
+
+// NEW: helper to build consistent viewer-scoped cache keys
+function viewerCacheKey(a: string, b: string, viewerId: string) {
+  const [x, y] = [a, b].sort();
+  return `chat:${x}:${y}:viewer:${viewerId}`;
+}
+
+// NEW: safe JSON.parse
+function safeParse<T>(s: string | null): T | null {
+  if (!s) return null;
+  try {
+    return JSON.parse(s) as T;
+  } catch {
+    return null;
+  }
+}
+
+// NEW: prepend a single item to a viewer’s cached array (bounded + TTL)
+async function prependToViewerCache(
+  key: string,
+  item: { id: string; senderId: string; timestamp: string; content: HybridEncrypted }
+) {
+  try {
+    const existing = await redis.get(key);
+    const arr = safeParse<typeof item[]>(existing) ?? [];
+    arr.unshift(item);
+    if (arr.length > HISTORY_CACHE_LIMIT) arr.length = HISTORY_CACHE_LIMIT;
+    await redis.set(key, JSON.stringify(arr), 'EX', CACHE_TTL_SECONDS);
+  } catch (e) {
+    // Cache failures should never break messaging; log and continue
+    console.error('Redis cache update failed:', (e as Error).message);
+  }
 }
 
 export const initializeWebSocket = (server: http.Server) => {
@@ -122,11 +158,30 @@ export const initializeWebSocket = (server: http.Server) => {
             },
           });
 
-          // Invalidate BOTH viewers' caches (viewer-scoped key, see controller fix below)
-          const ids = [userId, receiverId].sort();
-          const base = `chat:${ids[0]}:${ids[1]}`;
-          await redis.del(`${base}:viewer:${userId}`);
-          await redis.del(`${base}:viewer:${receiverId}`);
+          // --- NEW: Update viewer-scoped Redis caches (no longer just invalidate) ---
+          const tsISO = dbMessage.timestamp.toISOString();
+
+          const senderView = {
+            id: dbMessage.id,
+            senderId: dbMessage.senderId,
+            content: dbMessage.contentForSender as HybridEncrypted,
+            timestamp: tsISO,
+          };
+          const receiverView = {
+            id: dbMessage.id,
+            senderId: dbMessage.senderId,
+            content: dbMessage.contentForReceiver as HybridEncrypted,
+            timestamp: tsISO,
+          };
+
+          const senderKey = viewerCacheKey(userId, receiverId, userId);
+          const receiverKey = viewerCacheKey(userId, receiverId, receiverId);
+
+          // Try to prepend to existing caches; if key doesn't exist, this will create it.
+          await Promise.all([
+            prependToViewerCache(senderKey, senderView),
+            prependToViewerCache(receiverKey, receiverView),
+          ]);
 
           // Realtime to receiver -> their decryptable copy
           const receiverSocket = clients.get(receiverId);
@@ -135,8 +190,8 @@ export const initializeWebSocket = (server: http.Server) => {
               type: 'message',
               id: dbMessage.id,
               senderId: dbMessage.senderId,
-              content: dbMessage.contentForReceiver as HybridEncrypted,
-              timestamp: dbMessage.timestamp.toISOString(),
+              content: receiverView.content,
+              timestamp: tsISO,
             };
             receiverSocket.send(JSON.stringify(out));
           }
@@ -148,8 +203,8 @@ export const initializeWebSocket = (server: http.Server) => {
               type: 'message',
               id: dbMessage.id,
               senderId: dbMessage.senderId,
-              content: dbMessage.contentForSender as HybridEncrypted,
-              timestamp: dbMessage.timestamp.toISOString(),
+              content: senderView.content,
+              timestamp: tsISO,
             };
             senderSocket.send(JSON.stringify(out));
           }
