@@ -4,6 +4,7 @@ import cors from 'cors';
 import prisma from './config/prisma';
 import http from 'http';
 import { initializeWebSocket } from './socket/socket';
+import internalKeepalive from './routes/internalKeepalive';
 import userRoutes from './routes/userRoutes';
 import messageRoutes from './routes/messageRoutes'
 
@@ -36,6 +37,7 @@ app.get('/test-db-connection', async (req: Request, res: Response) => {
 // })
 
 // api routes
+app.use('/internal', internalKeepalive);
 app.use('/api/users', userRoutes);
 app.use('/api/messages', messageRoutes);
 
